@@ -40,12 +40,61 @@ def info(m): print(f"{C.CYAN}  ℹ  {m}{C.RESET}")
 def head(m): print(f"\n{C.BOLD}{C.BLUE}{'─'*58}\n  {m}\n{'─'*58}{C.RESET}")
 
 # ── DC definitions ────────────────────────────────────────────────────────────
+#
+#  upn_suffix   — appended to username for login:  firstname.lastname@nl.eu.com
+#  netbios      — NETBIOS domain prefix for NTLM:  NL\firstname.lastname
+#  user_logon   — canonical format shown to admin: NL\firstname.lastname
+#  base_dn      — LDAP search root for this domain
+#
 DCS = [
-    {"id":"UK", "host":"uk1-dc10.eu.uk.com",  "base_dn":"DC=eu,DC=uk,DC=com"},
-    {"id":"NL", "host":"nl1-dc01.eu.nl.com",  "base_dn":"DC=eu,DC=nl,DC=com"},
-    {"id":"SV", "host":"sv1-dc01.sv.zen.com", "base_dn":"DC=sv,DC=zen,DC=com"},
-    {"id":"NJ", "host":"nj1-dc01.nj.zen.com", "base_dn":"DC=nj,DC=zen,DC=com"},
+    {
+        "id":         "UK",
+        "host":       "uk1-dc10.uk.eu.com",
+        "base_dn":    "DC=uk,DC=eu,DC=com",
+        "upn_suffix": "uk.eu.com",
+        "netbios":    "UK",
+        "user_logon": "UK\\{username}",    # UK\firstname.lastname
+    },
+    {
+        "id":         "NL",
+        "host":       "nl1-dc01.nl.eu.com",
+        "base_dn":    "DC=nl,DC=eu,DC=com",
+        "upn_suffix": "nl.eu.com",
+        "netbios":    "NL",
+        "user_logon": "NL\\{username}",    # NL\firstname.lastname
+    },
+    {
+        "id":         "SV",
+        "host":       "sv1-dc01.sv.zen.com",
+        "base_dn":    "DC=sv,DC=zen,DC=com",
+        "upn_suffix": "sv.zen.com",
+        "netbios":    "SV",
+        "user_logon": "SV\\{username}",    # SV\firstname.lastname
+    },
+    {
+        "id":         "NJ",
+        "host":       "nj1-dc01.nj.zen.com",
+        "base_dn":    "DC=nj,DC=zen,DC=com",
+        "upn_suffix": "nj.zen.com",
+        "netbios":    "NJ",
+        "user_logon": "NJ\\{username}",    # NJ\firstname.lastname
+    },
 ]
+
+
+def fmt_upn(dc: dict, username: str) -> str:
+    """firstname.lastname@nl.eu.com"""
+    return f"{username}@{dc['upn_suffix']}"
+
+
+def fmt_logon(dc: dict, username: str) -> str:
+    """NL\firstname.lastname"""
+    return dc["user_logon"].format(username=username)
+
+
+def default_sam(first: str, last: str) -> str:
+    """firstname.lastname (Planview standard)"""
+    return f"{first.lower()}.{last.lower()}"
 
 # ── connection ────────────────────────────────────────────────────────────────
 def connect(dc, user, pwd) -> Optional[Connection]:
@@ -232,11 +281,16 @@ def op_create_user(conn, base_dn, dc_id):
     last  = input("  Last name : ").strip()
     if not first or not last: err("Name required"); return
 
-    default_sam = f"{first[0].lower()}{last.lower()}"
-    sam   = input(f"  Username [{default_sam}]: ").strip() or default_sam
-    domain= base_dn.replace("DC=","").replace(",",".")
-    upn   = input(f"  UPN [{sam}@{domain}]: ").strip() or f"{sam}@{domain}"
-    email = input(f"  Email [{upn}]: ").strip() or upn
+    # Per-DC username format: firstname.lastname
+    dc_obj    = next((d for d in DCS if d["id"] == dc_id), None)
+    def_sam   = default_sam(first, last)
+    def_upn   = fmt_upn(dc_obj, def_sam)   if dc_obj else f"{def_sam}@{base_dn}"
+    def_logon = fmt_logon(dc_obj, def_sam) if dc_obj else def_sam
+
+    print(f"\n  {C.DIM}Logon format for {dc_id}: {def_logon}{C.RESET}")
+    sam   = input(f"  Username [{def_sam}]: ").strip() or def_sam
+    upn   = input(f"  UPN      [{fmt_upn(dc_obj, sam) if dc_obj else sam}]: ").strip()             or (fmt_upn(dc_obj, sam) if dc_obj else sam)
+    email = input(f"  Email    [{upn}]: ").strip() or upn
     title = input("  Title (optional): ").strip()
     dept  = input("  Department (optional): ").strip()
 
@@ -272,9 +326,10 @@ def op_create_user(conn, base_dn, dc_id):
         manual_names = [g.strip() for g in raw.split(",") if g.strip()]
 
     # ── Summary ───────────────────────────────────────────────────────────
+    logon_display = fmt_logon(dc_obj, sam) if dc_obj else sam
     print(f"\n  {C.BOLD}Summary:{C.RESET}")
     print(f"  {'Name':<18} {first} {last}")
-    print(f"  {'Username':<18} {sam}")
+    print(f"  {'Logon':<18} {logon_display}")
     print(f"  {'UPN':<18} {upn}")
     print(f"  {'DN':<18} {udn}")
     if cloned_dns:   print(f"  {'Cloned groups':<18} {len(cloned_dns)} group(s)")
@@ -378,9 +433,19 @@ def select_op():
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def prompt_credentials() -> tuple:
-    """Prompt for AD credentials once at startup."""
+    """
+    Prompt for AD credentials once at startup.
+    Accepts NETBIOS format (NL\\firstname.lastname)
+    or UPN format (firstname.lastname@nl.eu.com).
+    """
     print(f"\n{C.BOLD}  Authentication{C.RESET}")
-    print(f"  {C.DIM}Enter your AD credentials. Supports DOMAIN\\user or user@domain{C.RESET}\n")
+    print(f"  {C.DIM}Accepted formats:{C.RESET}")
+    for dc in DCS:
+        example_sam = "firstname.lastname"
+        print(f"  {C.DIM}  {dc['id']:<4}  "
+              f"{fmt_logon(dc, example_sam):<30}  "
+              f"or  {fmt_upn(dc, example_sam)}{C.RESET}")
+    print()
     user = input("  Username: ").strip()
     if not user:
         err("Username required")
