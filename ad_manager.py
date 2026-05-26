@@ -206,6 +206,26 @@ def op_groups(conn, base_dn, dc_id):
         if DEBUG: traceback.print_exc()
 
 
+def clone_groups_from_user(conn, base_dn, dc_id) -> list:
+    """Look up an existing user and return their group DNs."""
+    term = input("  Clone groups from username: ").strip()
+    if not term: return []
+    source = find_user(conn, base_dn, term)
+    if not source:
+        err(f"User '{term}' not found on {dc_id}")
+        return []
+    raw = source.memberOf.values if hasattr(source.memberOf, "values") else []
+    if not raw:
+        warn(f"{source.displayName} has no groups to clone")
+        return []
+    print(f"\n  {C.BOLD}Groups from {source.displayName}:{C.RESET}")
+    for g in raw:
+        cn = g.split(",")[0].replace("CN=","")
+        print(f"    {C.DIM}✓  {cn}{C.RESET}")
+    print(f"\n  {C.CYAN}{len(raw)} group(s){C.RESET} will be cloned")
+    return list(raw)
+
+
 def op_create_user(conn, base_dn, dc_id):
     head(f"CREATE USER — {dc_id}")
     first = input("  First name: ").strip()
@@ -234,15 +254,33 @@ def op_create_user(conn, base_dn, dc_id):
     if len(pw) < 8: err("Min 8 chars"); return
     force = input("  Force change on login? [Y/n]: ").strip().lower() != "n"
 
-    groups_raw = input("  Groups to add (comma-separated, optional): ").strip()
-    group_names = [g.strip() for g in groups_raw.split(",") if g.strip()]
+    # ── Group assignment ──────────────────────────────────────────────────
+    print(f"\n  {C.BOLD}Group assignment:{C.RESET}")
+    print(f"    {C.CYAN}[1]{C.RESET}  Clone from existing user")
+    print(f"    {C.CYAN}[2]{C.RESET}  Enter groups manually")
+    print(f"    {C.CYAN}[3]{C.RESET}  Clone from existing user + add extra groups")
+    print(f"    {C.CYAN}[4]{C.RESET}  Skip — no groups")
+    grp_choice = input("  Choice [4]: ").strip() or "4"
 
+    cloned_dns   = []
+    manual_names = []
+
+    if grp_choice in ("1", "3"):
+        cloned_dns = clone_groups_from_user(conn, base_dn, dc_id)
+    if grp_choice in ("2", "3"):
+        raw = input("  Extra groups (comma-separated): ").strip()
+        manual_names = [g.strip() for g in raw.split(",") if g.strip()]
+
+    # ── Summary ───────────────────────────────────────────────────────────
     print(f"\n  {C.BOLD}Summary:{C.RESET}")
     print(f"  {'Name':<18} {first} {last}")
     print(f"  {'Username':<18} {sam}")
     print(f"  {'UPN':<18} {upn}")
     print(f"  {'DN':<18} {udn}")
-    if group_names: print(f"  {'Groups':<18} {', '.join(group_names)}")
+    if cloned_dns:   print(f"  {'Cloned groups':<18} {len(cloned_dns)} group(s)")
+    if manual_names: print(f"  {'Manual groups':<18} {', '.join(manual_names)}")
+    if not cloned_dns and not manual_names:
+        print(f"  {'Groups':<18} None")
 
     if not confirm(f"Create user on {dc_id}?"): return
 
@@ -255,7 +293,7 @@ def op_create_user(conn, base_dn, dc_id):
             "sn":                 last,
             "displayName":        f"{first} {last}",
             "mail":               email,
-            "userAccountControl": 514,  # disabled until password is set
+            "userAccountControl": 514,
         }
         if title: attrs["title"]      = title
         if dept:  attrs["department"] = dept
@@ -266,7 +304,7 @@ def op_create_user(conn, base_dn, dc_id):
         ok("Account created")
 
         if not ad_modify_password(conn, udn, pw, old_password=None):
-            err(f"Password set failed — account exists but disabled: {conn.result}"); return
+            err(f"Password set failed: {conn.result}"); return
         ok("Password set")
 
         conn.modify(udn, {"userAccountControl": [(MODIFY_REPLACE, [512])]})
@@ -274,7 +312,13 @@ def op_create_user(conn, base_dn, dc_id):
             conn.modify(udn, {"pwdLastSet": [(MODIFY_REPLACE, [0])]})
         ok("Account enabled")
 
-        for gname in group_names:
+        if cloned_dns:
+            if ad_add_members_to_groups(conn, [udn], cloned_dns):
+                ok(f"Cloned {len(cloned_dns)} group(s) from source user")
+            else:
+                warn(f"Some cloned groups failed: {conn.result}")
+
+        for gname in manual_names:
             g = find_group(conn, base_dn, gname)
             if not g: warn(f"Group '{gname}' not found — skipped"); continue
             if ad_add_members_to_groups(conn, [udn], [dn(g)]):
