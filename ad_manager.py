@@ -68,17 +68,17 @@ def head(m): print(f"\n{C.BOLD}{C.BLUE}{'─'*58}\n  {m}\n{'─'*58}{C.RESET}")
 DCS = [
     {
         "id":         "UK",
-        "host":       "uk1-dc10.uk.eu.com",
-        "base_dn":    "DC=uk,DC=eu,DC=com",
-        "upn_suffix": "uk.eu.com",
+        "host":       "uk1-dc10.eu.uk.com",
+        "base_dn":    "DC=eu,DC=uk,DC=com",
+        "upn_suffix": "eu.uk.com",
         "netbios":    "UK",
         "user_logon": "UK\\{username}",    # UK\firstname.lastname
     },
     {
         "id":         "NL",
-        "host":       "nl1-dc01.nl.eu.com",
-        "base_dn":    "DC=nl,DC=eu,DC=com",
-        "upn_suffix": "nl.eu.com",
+        "host":       "nl1-dc01.eu.nl.com",
+        "base_dn":    "DC=eu,DC=nl,DC=com",
+        "upn_suffix": "eu.nl.com",
         "netbios":    "NL",
         "user_logon": "NL\\{username}",    # NL\firstname.lastname
     },
@@ -575,8 +575,7 @@ def test_connections(dcs: list, user: str, pwd: str) -> dict:
     for dc in dcs:
         conn = connect(dc, user, pwd)
         connections[dc["id"]] = conn
-        if not conn:
-            print(f"  {C.RED}  ✗  {dc['id']} — unreachable or auth failed{C.RESET}")
+        # connect() already prints success/failure — no duplicate message needed
 
     ok_count   = sum(1 for c in connections.values() if c)
     fail_count = len(connections) - ok_count
@@ -586,7 +585,7 @@ def test_connections(dcs: list, user: str, pwd: str) -> dict:
           f"{(C.RED + f'✗ {fail_count} failed' + C.RESET) if fail_count else ''}")
 
     if ok_count == 0:
-        err("\n  No DCs reachable. Check VPN and credentials.")
+        err("No DCs reachable — check VPN and credentials.")
         sys.exit(1)
 
     return connections
