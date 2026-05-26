@@ -68,17 +68,17 @@ def head(m): print(f"\n{C.BOLD}{C.BLUE}{'─'*58}\n  {m}\n{'─'*58}{C.RESET}")
 DCS = [
     {
         "id":         "UK",
-        "host":       "uk1-dc10.eu.uk.com",
-        "base_dn":    "DC=eu,DC=uk,DC=com",
-        "upn_suffix": "eu.uk.com",
+        "host":       "uk1-dc10.uk.eu.com",
+        "base_dn":    "DC=uk,DC=eu,DC=com",
+        "upn_suffix": "uk.eu.com",
         "netbios":    "UK",
         "user_logon": "UK\\{username}",    # UK\firstname.lastname
     },
     {
         "id":         "NL",
-        "host":       "nl1-dc01.eu.nl.com",
-        "base_dn":    "DC=eu,DC=nl,DC=com",
-        "upn_suffix": "eu.nl.com",
+        "host":       "nl1-dc01.nl.eu.com",
+        "base_dn":    "DC=nl,DC=eu,DC=com",
+        "upn_suffix": "nl.eu.com",
         "netbios":    "NL",
         "user_logon": "NL\\{username}",    # NL\firstname.lastname
     },
