@@ -27,6 +27,25 @@ except ImportError:
 
 DEBUG = "--debug" in sys.argv
 
+
+class ADOperationError(Exception):
+    """Raised when an AD operation fails — caught per-DC so other DCs still run."""
+    pass
+
+
+def verify_ou_exists(conn, ou_dn: str) -> bool:
+    """
+    Confirm the given OU DN actually exists on this DC.
+    Returns True if found, False if not.
+    Does NOT create the OU — errors are handled by the caller.
+    """
+    try:
+        conn.search(ou_dn, "(objectClass=*)", search_scope="BASE",
+                    attributes=["distinguishedName"])
+        return bool(conn.entries)
+    except Exception:
+        return False
+
 # ── colours ───────────────────────────────────────────────────────────────────
 class C:
     RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
@@ -299,8 +318,10 @@ def op_permissions(conn, base_dn, dc_id):
             if not desc: return
             conn.modify(dn(u), {"description": [(MODIFY_REPLACE, [desc])]})
             ok(f"Description updated")
+    except ADOperationError:
+        raise
     except Exception as e:
-        err(str(e))
+        err(f"AD operation failed on {dc_id}: {e}")
         if DEBUG: traceback.print_exc()
 
 
@@ -327,8 +348,10 @@ def op_groups(conn, base_dn, dc_id):
             r = ad_remove_members_from_groups(conn, [dn(u)], [dn(g)], fix=True)
         if r: ok(f"Done — {u.displayName} / {g.cn} on {dc_id}")
         else: err(f"Failed: {conn.result}")
+    except ADOperationError:
+        raise
     except Exception as e:
-        err(str(e))
+        err(f"AD operation failed on {dc_id}: {e}")
         if DEBUG: traceback.print_exc()
 
 
@@ -412,6 +435,16 @@ def op_create_user(conn, base_dn, dc_id):
 
     if not confirm(f"Create user on {dc_id}?"): return
 
+    # ── Verify OU exists on THIS DC before doing anything ─────────────────
+    # Critical for multi-DC runs: each DC may have different OU structures.
+    if not ou_dn.startswith("CN=Users"):
+        if not verify_ou_exists(conn, ou_dn):
+            err(f"OU not found on {dc_id}: {ou_dn}")
+            err(f"Skipping user creation on {dc_id} — OU does not exist here.")
+            err(f"No changes were made on {dc_id}.")
+            return
+        ok(f"OU verified on {dc_id}")
+
     try:
         attrs = {
             "objectClass":        ["top","person","organizationalPerson","user"],
@@ -455,8 +488,10 @@ def op_create_user(conn, base_dn, dc_id):
                 warn(f"Could not add to {gname}")
 
         ok(f"✅  {first} {last} ({sam}) created on {dc_id}")
+    except ADOperationError:
+        raise
     except Exception as e:
-        err(str(e))
+        err(f"AD operation failed on {dc_id}: {e}")
         if DEBUG: traceback.print_exc()
 
 
@@ -637,8 +672,12 @@ def main():
                 elif op == "6": op_lookup(conn, dc["base_dn"], dc["id"])
             except KeyboardInterrupt:
                 warn("Interrupted")
+            except ADOperationError as e:
+                err(f"Operation failed on {dc['id']}: {e}")
+                err(f"No changes were made on {dc['id']}.")
+                if DEBUG: traceback.print_exc()
             except Exception as e:
-                err(f"Unexpected error: {e}")
+                err(f"Unexpected error on {dc['id']}: {e}")
                 if DEBUG: traceback.print_exc()
 
         if len(active_dcs) > 1:
