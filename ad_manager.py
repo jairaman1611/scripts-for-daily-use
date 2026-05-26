@@ -153,22 +153,29 @@ def build_ntlm_user(dc: dict, user: str) -> str:
 
 def connect(dc, user, pwd) -> Optional[Connection]:
     ntlm_user = build_ntlm_user(dc, user)
+    print(f"  {C.DIM}  Trying {dc['host']} as {ntlm_user}{C.RESET}")
     for port, use_ssl in [(636, True), (389, False)]:
+        proto = "LDAPS" if use_ssl else "LDAP"
+        print(f"  {C.DIM}  → Testing {proto} port {port}...{C.RESET}")
         try:
             tls    = Tls(validate=ssl.CERT_NONE) if use_ssl else None
             server = Server(dc["host"], port=port, use_ssl=use_ssl,
                             tls=tls, get_info=ALL, connect_timeout=8)
             conn   = Connection(server, user=ntlm_user, password=pwd,
                                 authentication=NTLM, auto_bind=True)
-            ok(f"Connected to {dc['id']} ({dc['host']}) via {'LDAPS' if use_ssl else 'LDAP'}"
+            ok(f"Connected to {dc['id']} ({dc['host']}) via {proto}"
                f"  {C.DIM}as {ntlm_user}{C.RESET}")
             return conn
-        except LDAPBindError:
-            err(f"Authentication failed for {dc['id']} — wrong credentials?")
+        except LDAPBindError as e:
+            err(f"Auth failed on {dc['id']} port {port} — bad credentials?  {C.DIM}{e}{C.RESET}")
             return None
-        except (LDAPSocketOpenError, Exception):
+        except LDAPSocketOpenError as e:
+            print(f"  {C.DIM}  ✗  Port {port} unreachable: {e}{C.RESET}")
             continue
-    err(f"Cannot reach {dc['id']} ({dc['host']}) — VPN connected?")
+        except Exception as e:
+            print(f"  {C.DIM}  ✗  Port {port} error ({type(e).__name__}): {e}{C.RESET}")
+            continue
+    err(f"Cannot reach {dc['id']} ({dc['host']}) on port 636 or 389 — VPN connected?")
     return None
 
 # ── helpers ───────────────────────────────────────────────────────────────────
