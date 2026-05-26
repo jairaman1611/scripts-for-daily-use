@@ -377,6 +377,48 @@ def select_op():
     return input("\n  Choice: ").strip()
 
 # ── main ──────────────────────────────────────────────────────────────────────
+def prompt_credentials() -> tuple:
+    """Prompt for AD credentials once at startup."""
+    print(f"\n{C.BOLD}  Authentication{C.RESET}")
+    print(f"  {C.DIM}Enter your AD credentials. Supports DOMAIN\\user or user@domain{C.RESET}\n")
+    user = input("  Username: ").strip()
+    if not user:
+        err("Username required")
+        sys.exit(1)
+    pwd = getpass.getpass("  Password: ")
+    if not pwd:
+        err("Password required")
+        sys.exit(1)
+    return user, pwd
+
+
+def test_connections(dcs: list, user: str, pwd: str) -> dict:
+    """
+    Test authentication against each DC before allowing any operations.
+    Returns dict of {dc_id: connection | None}
+    """
+    print(f"\n{C.BOLD}  Testing connections...{C.RESET}\n")
+    connections = {}
+    for dc in dcs:
+        conn = connect(dc, user, pwd)
+        connections[dc["id"]] = conn
+        if not conn:
+            print(f"  {C.RED}  ✗  {dc['id']} — unreachable or auth failed{C.RESET}")
+
+    ok_count   = sum(1 for c in connections.values() if c)
+    fail_count = len(connections) - ok_count
+
+    print(f"\n  {C.BOLD}Connection summary:{C.RESET}")
+    print(f"  {C.GREEN}✓ {ok_count} connected{C.RESET}  "
+          f"{(C.RED + f'✗ {fail_count} failed' + C.RESET) if fail_count else ''}")
+
+    if ok_count == 0:
+        err("\n  No DCs reachable. Check VPN and credentials.")
+        sys.exit(1)
+
+    return connections
+
+
 def main():
     print(f"""
 {C.BOLD}{C.MAGENTA}╔══════════════════════════════════════════════════╗
@@ -384,48 +426,95 @@ def main():
 ║   Mac → Windows Active Directory via LDAP(S)     ║
 ╚══════════════════════════════════════════════════╝{C.RESET}
 """)
-    shared = input("  Same credentials for all DCs? [Y/n]: ").strip().lower() != "n"
-    creds = {}
-    if shared:
-        creds["user"] = input("  Username (DOMAIN\\\\user or user@domain): ").strip()
-        creds["pwd"]  = getpass.getpass("  Password: ")
 
+    # ── Step 1: credentials ───────────────────────────────────────────────
+    user, pwd = prompt_credentials()
+
+    # ── Step 2: select DCs and test auth before doing anything ────────────
+    print(f"\n{C.BOLD}  Which DCs do you want to work with this session?{C.RESET}")
+    session_dcs = select_dcs()
+
+    connections = test_connections(session_dcs, user, pwd)
+
+    # Keep only reachable DCs for this session
+    active_dcs = [dc for dc in session_dcs if connections.get(dc["id"])]
+
+    if len(active_dcs) < len(session_dcs):
+        skipped = [dc["id"] for dc in session_dcs if not connections.get(dc["id"])]
+        warn(f"Skipping unreachable: {', '.join(skipped)}")
+
+    print(f"\n{C.GREEN}{C.BOLD}  ✓  Authenticated. Ready to perform operations on: "
+          f"{', '.join(dc['id'] for dc in active_dcs)}{C.RESET}")
+
+    # ── Step 3: operation loop ────────────────────────────────────────────
     while True:
-        dcs = select_dcs()
-        op  = select_op()
-        if op == "0":
-            print(f"\n  {C.DIM}Goodbye.{C.RESET}\n"); break
-        if op not in [c for c,_ in OPS[:-1]]:
-            warn("Invalid choice"); continue
+        # Allow switching to a different DC subset within the session
+        print(f"\n  {C.DIM}Active DCs: {', '.join(dc['id'] for dc in active_dcs)}")
+        print(f"  Type 's' to switch DCs, or pick an operation below.{C.RESET}")
 
-        for dc in dcs:
+        op = select_op()
+
+        if op == "0":
+            print(f"\n  {C.DIM}Closing connections...{C.RESET}")
+            for conn in connections.values():
+                try:
+                    if conn: conn.unbind()
+                except Exception:
+                    pass
+            print(f"  {C.DIM}Goodbye.{C.RESET}\n")
+            break
+
+        if op == "s":
+            # Re-select DCs within the same session (reuse existing connections)
+            print(f"\n{C.BOLD}  Select DCs for next operation:{C.RESET}")
+            new_selection = select_dcs()
+            # Connect to any newly selected DCs not yet in session
+            for dc in new_selection:
+                if dc["id"] not in connections:
+                    conn = connect(dc, user, pwd)
+                    connections[dc["id"]] = conn
+            active_dcs = [dc for dc in new_selection if connections.get(dc["id"])]
+            if not active_dcs:
+                err("None of the selected DCs are reachable")
+            else:
+                ok(f"Now targeting: {', '.join(dc['id'] for dc in active_dcs)}")
+            continue
+
+        if op not in [c for c, _ in OPS[:-1]]:
+            warn("Invalid choice")
+            continue
+
+        for dc in active_dcs:
             print(f"\n{C.BOLD}{C.BLUE}  ── {dc['id']} ({dc['host']}) ──{C.RESET}")
-            if not shared:
-                creds["user"] = input(f"  Username for {dc['id']}: ").strip()
-                creds["pwd"]  = getpass.getpass("  Password: ")
-            conn = connect(dc, creds["user"], creds["pwd"])
-            if not conn: continue
+            conn = connections.get(dc["id"])
+            if not conn:
+                warn(f"No active connection to {dc['id']} — skipping")
+                continue
             try:
-                if   op=="1": op_reset_password(conn, dc["base_dn"], dc["id"])
-                elif op=="2": op_unlock(conn, dc["base_dn"], dc["id"])
-                elif op=="3": op_permissions(conn, dc["base_dn"], dc["id"])
-                elif op=="4": op_groups(conn, dc["base_dn"], dc["id"])
-                elif op=="5": op_create_user(conn, dc["base_dn"], dc["id"])
-                elif op=="6": op_lookup(conn, dc["base_dn"], dc["id"])
+                if   op == "1": op_reset_password(conn, dc["base_dn"], dc["id"])
+                elif op == "2": op_unlock(conn, dc["base_dn"], dc["id"])
+                elif op == "3": op_permissions(conn, dc["base_dn"], dc["id"])
+                elif op == "4": op_groups(conn, dc["base_dn"], dc["id"])
+                elif op == "5": op_create_user(conn, dc["base_dn"], dc["id"])
+                elif op == "6": op_lookup(conn, dc["base_dn"], dc["id"])
             except KeyboardInterrupt:
                 warn("Interrupted")
             except Exception as e:
                 err(f"Unexpected error: {e}")
                 if DEBUG: traceback.print_exc()
-            finally:
-                try: conn.unbind()
-                except: pass
 
-        if len(dcs) > 1:
-            print(f"\n{C.GREEN}{C.BOLD}  ✓  Done on {len(dcs)} DC(s){C.RESET}")
+        if len(active_dcs) > 1:
+            print(f"\n{C.GREEN}{C.BOLD}  ✓  Done on {len(active_dcs)} DC(s){C.RESET}")
 
         if input(f"\n  {C.DIM}Another operation? [Y/n]: {C.RESET}").strip().lower() == "n":
-            print(f"\n  {C.DIM}Goodbye.{C.RESET}\n"); break
+            print(f"\n  {C.DIM}Closing connections...{C.RESET}")
+            for conn in connections.values():
+                try:
+                    if conn: conn.unbind()
+                except Exception:
+                    pass
+            print(f"  {C.DIM}Goodbye.{C.RESET}\n")
+            break
 
 if __name__ == "__main__":
     try:
