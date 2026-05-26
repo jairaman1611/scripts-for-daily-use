@@ -27,6 +27,25 @@ except ImportError:
 
 DEBUG = "--debug" in sys.argv
 
+
+class ADOperationError(Exception):
+    """Raised when an AD operation fails — caught per-DC so other DCs still run."""
+    pass
+
+
+def verify_ou_exists(conn, ou_dn: str) -> bool:
+    """
+    Confirm the given OU DN actually exists on this DC.
+    Returns True if found, False if not.
+    Does NOT create the OU — errors are handled by the caller.
+    """
+    try:
+        conn.search(ou_dn, "(objectClass=*)", search_scope="BASE",
+                    attributes=["distinguishedName"])
+        return bool(conn.entries)
+    except Exception:
+        return False
+
 # ── colours ───────────────────────────────────────────────────────────────────
 class C:
     RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
@@ -40,12 +59,61 @@ def info(m): print(f"{C.CYAN}  ℹ  {m}{C.RESET}")
 def head(m): print(f"\n{C.BOLD}{C.BLUE}{'─'*58}\n  {m}\n{'─'*58}{C.RESET}")
 
 # ── DC definitions ────────────────────────────────────────────────────────────
+#
+#  upn_suffix   — appended to username for login:  firstname.lastname@nl.eu.com
+#  netbios      — NETBIOS domain prefix for NTLM:  NL\firstname.lastname
+#  user_logon   — canonical format shown to admin: NL\firstname.lastname
+#  base_dn      — LDAP search root for this domain
+#
 DCS = [
-    {"id":"UK", "host":"uk1-dc10.eu.uk.com",  "base_dn":"DC=eu,DC=uk,DC=com"},
-    {"id":"NL", "host":"nl1-dc01.eu.nl.com",  "base_dn":"DC=eu,DC=nl,DC=com"},
-    {"id":"SV", "host":"sv1-dc01.sv.zen.com", "base_dn":"DC=sv,DC=zen,DC=com"},
-    {"id":"NJ", "host":"nj1-dc01.nj.zen.com", "base_dn":"DC=nj,DC=zen,DC=com"},
+    {
+        "id":         "UK",
+        "host":       "uk1-dc10.uk.eu.com",
+        "base_dn":    "DC=uk,DC=eu,DC=com",
+        "upn_suffix": "uk.eu.com",
+        "netbios":    "UK",
+        "user_logon": "UK\\{username}",    # UK\firstname.lastname
+    },
+    {
+        "id":         "NL",
+        "host":       "nl1-dc01.nl.eu.com",
+        "base_dn":    "DC=nl,DC=eu,DC=com",
+        "upn_suffix": "nl.eu.com",
+        "netbios":    "NL",
+        "user_logon": "NL\\{username}",    # NL\firstname.lastname
+    },
+    {
+        "id":         "SV",
+        "host":       "sv1-dc01.sv.zen.com",
+        "base_dn":    "DC=sv,DC=zen,DC=com",
+        "upn_suffix": "sv.zen.com",
+        "netbios":    "SV",
+        "user_logon": "SV\\{username}",    # SV\firstname.lastname
+    },
+    {
+        "id":         "NJ",
+        "host":       "nj1-dc01.nj.zen.com",
+        "base_dn":    "DC=nj,DC=zen,DC=com",
+        "upn_suffix": "nj.zen.com",
+        "netbios":    "NJ",
+        "user_logon": "NJ\\{username}",    # NJ\firstname.lastname
+    },
 ]
+
+
+def fmt_upn(dc: dict, username: str) -> str:
+    """firstname.lastname@nl.eu.com"""
+    return f"{username}@{dc['upn_suffix']}"
+
+
+def fmt_logon(dc: dict, username: str) -> str:
+    """NL\firstname.lastname"""
+    return dc["user_logon"].format(username=username)
+
+
+def default_sam(first: str, last: str) -> str:
+    """firstname.lastname (Planview standard)"""
+    return f"{first.lower()}.{last.lower()}"
 
 # ── connection ────────────────────────────────────────────────────────────────
 def connect(dc, user, pwd) -> Optional[Connection]:
@@ -84,6 +152,83 @@ def find_group(conn, base_dn, name):
     return conn.entries[0] if conn.entries else None
 
 def dn(e): return str(e.entry_dn)
+
+
+def fetch_ous(conn, base_dn) -> list:
+    """
+    Fetch all Organizational Units from the DC and return as a sorted list of dicts.
+    Each dict has: name, dn, path (human-readable indented path)
+    """
+    conn.search(
+        base_dn,
+        "(objectClass=organizationalUnit)",
+        SUBTREE,
+        attributes=["distinguishedName", "name", "description"]
+    )
+    ous = []
+    for entry in conn.entries:
+        ou_dn   = str(entry.entry_dn)
+        ou_name = str(entry.name)
+        # Build a readable path by stripping the base_dn and reversing OU parts
+        relative = ou_dn.replace(f",{base_dn}", "")
+        parts    = [p.replace("OU=","") for p in relative.split(",") if p.startswith("OU=")]
+        parts.reverse()
+        path = " / ".join(parts) if parts else ou_name
+        ous.append({"name": ou_name, "dn": ou_dn, "path": path})
+    # Sort by path so parent OUs appear before children
+    ous.sort(key=lambda x: x["path"].lower())
+    return ous
+
+
+def select_ou(conn, base_dn, dc_id) -> str:
+    """
+    Interactively select an OU from the DC or enter a custom path.
+    Returns the full OU DN string (e.g. OU=Debug servers,DC=nl,DC=eu,DC=com)
+    """
+    print(f"\n  {C.DIM}Fetching OUs from {dc_id}...{C.RESET}")
+    ous = fetch_ous(conn, base_dn)
+
+    if not ous:
+        warn("No OUs found — defaulting to CN=Users")
+        return f"CN=Users,{base_dn}"
+
+    print(f"\n  {C.BOLD}Available OUs on {dc_id}:{C.RESET}")
+    print(f"  {C.DIM}{'No.':<5} {'OU Path'}{C.RESET}")
+    print(f"  {'─'*55}")
+
+    for i, ou in enumerate(ous, 1):
+        # Indent nested OUs visually
+        depth  = ou["path"].count(" / ")
+        indent = "  " * depth
+        label  = ou["path"].split(" / ")[-1]
+        print(f"  {C.CYAN}[{i:>2}]{C.RESET}  {indent}{label}"
+              + (f"  {C.DIM}({ou['path']}){C.RESET}" if depth > 0 else ""))
+
+    print(f"  {C.CYAN}[ 0]{C.RESET}  CN=Users (default container)")
+    print(f"  {C.CYAN}[ M]{C.RESET}  Enter path manually")
+
+    choice = input(f"\n  Select OU [0]: ").strip()
+
+    if choice == "0" or choice == "":
+        return f"CN=Users,{base_dn}"
+
+    if choice.upper() == "M":
+        manual = input("  Full OU path (e.g. OU=Debug servers,OU=PRD Users): ").strip()
+        if not manual:
+            return f"CN=Users,{base_dn}"
+        return f"{manual},{base_dn}"
+
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(ous):
+            selected = ous[idx]
+            ok(f"Selected: {selected['path']}")
+            return selected["dn"]
+    except ValueError:
+        pass
+
+    warn("Invalid choice — using CN=Users")
+    return f"CN=Users,{base_dn}"
 
 def disabled(uac):
     try: return bool(int(str(uac)) & 2)
@@ -173,8 +318,10 @@ def op_permissions(conn, base_dn, dc_id):
             if not desc: return
             conn.modify(dn(u), {"description": [(MODIFY_REPLACE, [desc])]})
             ok(f"Description updated")
+    except ADOperationError:
+        raise
     except Exception as e:
-        err(str(e))
+        err(f"AD operation failed on {dc_id}: {e}")
         if DEBUG: traceback.print_exc()
 
 
@@ -201,8 +348,10 @@ def op_groups(conn, base_dn, dc_id):
             r = ad_remove_members_from_groups(conn, [dn(u)], [dn(g)], fix=True)
         if r: ok(f"Done — {u.displayName} / {g.cn} on {dc_id}")
         else: err(f"Failed: {conn.result}")
+    except ADOperationError:
+        raise
     except Exception as e:
-        err(str(e))
+        err(f"AD operation failed on {dc_id}: {e}")
         if DEBUG: traceback.print_exc()
 
 
@@ -232,21 +381,22 @@ def op_create_user(conn, base_dn, dc_id):
     last  = input("  Last name : ").strip()
     if not first or not last: err("Name required"); return
 
-    default_sam = f"{first[0].lower()}{last.lower()}"
-    sam   = input(f"  Username [{default_sam}]: ").strip() or default_sam
-    domain= base_dn.replace("DC=","").replace(",",".")
-    upn   = input(f"  UPN [{sam}@{domain}]: ").strip() or f"{sam}@{domain}"
-    email = input(f"  Email [{upn}]: ").strip() or upn
+    # Per-DC username format: firstname.lastname
+    dc_obj    = next((d for d in DCS if d["id"] == dc_id), None)
+    def_sam   = default_sam(first, last)
+    def_upn   = fmt_upn(dc_obj, def_sam)   if dc_obj else f"{def_sam}@{base_dn}"
+    def_logon = fmt_logon(dc_obj, def_sam) if dc_obj else def_sam
+
+    print(f"\n  {C.DIM}Logon format for {dc_id}: {def_logon}{C.RESET}")
+    sam   = input(f"  Username [{def_sam}]: ").strip() or def_sam
+    upn   = input(f"  UPN      [{fmt_upn(dc_obj, sam) if dc_obj else sam}]: ").strip()             or (fmt_upn(dc_obj, sam) if dc_obj else sam)
+    email = input(f"  Email    [{upn}]: ").strip() or upn
     title = input("  Title (optional): ").strip()
     dept  = input("  Department (optional): ").strip()
 
-    print(f"\n  OU:  {C.CYAN}[1]{C.RESET} CN=Users (default)   {C.CYAN}[2]{C.RESET} Custom path")
-    ou_c  = input("  Choice [1]: ").strip()
-    if ou_c == "2":
-        ou  = input("  OU path (e.g. OU=IT,OU=Staff): ").strip()
-        udn = f"CN={first} {last},{ou},{base_dn}"
-    else:
-        udn = f"CN={first} {last},CN=Users,{base_dn}"
+    # Fetch real OUs from DC and let user pick
+    ou_dn = select_ou(conn, base_dn, dc_id)
+    udn   = f"CN={first} {last},{ou_dn}"
 
     pw  = getpass.getpass("\n  Password: ")
     pw2 = getpass.getpass("  Confirm : ")
@@ -272,9 +422,10 @@ def op_create_user(conn, base_dn, dc_id):
         manual_names = [g.strip() for g in raw.split(",") if g.strip()]
 
     # ── Summary ───────────────────────────────────────────────────────────
+    logon_display = fmt_logon(dc_obj, sam) if dc_obj else sam
     print(f"\n  {C.BOLD}Summary:{C.RESET}")
     print(f"  {'Name':<18} {first} {last}")
-    print(f"  {'Username':<18} {sam}")
+    print(f"  {'Logon':<18} {logon_display}")
     print(f"  {'UPN':<18} {upn}")
     print(f"  {'DN':<18} {udn}")
     if cloned_dns:   print(f"  {'Cloned groups':<18} {len(cloned_dns)} group(s)")
@@ -283,6 +434,16 @@ def op_create_user(conn, base_dn, dc_id):
         print(f"  {'Groups':<18} None")
 
     if not confirm(f"Create user on {dc_id}?"): return
+
+    # ── Verify OU exists on THIS DC before doing anything ─────────────────
+    # Critical for multi-DC runs: each DC may have different OU structures.
+    if not ou_dn.startswith("CN=Users"):
+        if not verify_ou_exists(conn, ou_dn):
+            err(f"OU not found on {dc_id}: {ou_dn}")
+            err(f"Skipping user creation on {dc_id} — OU does not exist here.")
+            err(f"No changes were made on {dc_id}.")
+            return
+        ok(f"OU verified on {dc_id}")
 
     try:
         attrs = {
@@ -327,8 +488,10 @@ def op_create_user(conn, base_dn, dc_id):
                 warn(f"Could not add to {gname}")
 
         ok(f"✅  {first} {last} ({sam}) created on {dc_id}")
+    except ADOperationError:
+        raise
     except Exception as e:
-        err(str(e))
+        err(f"AD operation failed on {dc_id}: {e}")
         if DEBUG: traceback.print_exc()
 
 
@@ -378,9 +541,19 @@ def select_op():
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def prompt_credentials() -> tuple:
-    """Prompt for AD credentials once at startup."""
+    """
+    Prompt for AD credentials once at startup.
+    Accepts NETBIOS format (NL\\firstname.lastname)
+    or UPN format (firstname.lastname@nl.eu.com).
+    """
     print(f"\n{C.BOLD}  Authentication{C.RESET}")
-    print(f"  {C.DIM}Enter your AD credentials. Supports DOMAIN\\user or user@domain{C.RESET}\n")
+    print(f"  {C.DIM}Accepted formats:{C.RESET}")
+    for dc in DCS:
+        example_sam = "firstname.lastname"
+        print(f"  {C.DIM}  {dc['id']:<4}  "
+              f"{fmt_logon(dc, example_sam):<30}  "
+              f"or  {fmt_upn(dc, example_sam)}{C.RESET}")
+    print()
     user = input("  Username: ").strip()
     if not user:
         err("Username required")
@@ -499,8 +672,12 @@ def main():
                 elif op == "6": op_lookup(conn, dc["base_dn"], dc["id"])
             except KeyboardInterrupt:
                 warn("Interrupted")
+            except ADOperationError as e:
+                err(f"Operation failed on {dc['id']}: {e}")
+                err(f"No changes were made on {dc['id']}.")
+                if DEBUG: traceback.print_exc()
             except Exception as e:
-                err(f"Unexpected error: {e}")
+                err(f"Unexpected error on {dc['id']}: {e}")
                 if DEBUG: traceback.print_exc()
 
         if len(active_dcs) > 1:
