@@ -76,7 +76,7 @@ DCS = [
     },
     {
         "id":         "NL",
-        "host":       "nl1-dc01.nl.eu.com",
+        "host":       "nl1-dc1.nl.eu.com",
         "base_dn":    "DC=nl,DC=eu,DC=com",
         "upn_suffix": "nl.eu.com",
         "netbios":    "NL",
