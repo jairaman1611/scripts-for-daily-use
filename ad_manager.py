@@ -134,6 +134,83 @@ def find_group(conn, base_dn, name):
 
 def dn(e): return str(e.entry_dn)
 
+
+def fetch_ous(conn, base_dn) -> list:
+    """
+    Fetch all Organizational Units from the DC and return as a sorted list of dicts.
+    Each dict has: name, dn, path (human-readable indented path)
+    """
+    conn.search(
+        base_dn,
+        "(objectClass=organizationalUnit)",
+        SUBTREE,
+        attributes=["distinguishedName", "name", "description"]
+    )
+    ous = []
+    for entry in conn.entries:
+        ou_dn   = str(entry.entry_dn)
+        ou_name = str(entry.name)
+        # Build a readable path by stripping the base_dn and reversing OU parts
+        relative = ou_dn.replace(f",{base_dn}", "")
+        parts    = [p.replace("OU=","") for p in relative.split(",") if p.startswith("OU=")]
+        parts.reverse()
+        path = " / ".join(parts) if parts else ou_name
+        ous.append({"name": ou_name, "dn": ou_dn, "path": path})
+    # Sort by path so parent OUs appear before children
+    ous.sort(key=lambda x: x["path"].lower())
+    return ous
+
+
+def select_ou(conn, base_dn, dc_id) -> str:
+    """
+    Interactively select an OU from the DC or enter a custom path.
+    Returns the full OU DN string (e.g. OU=Debug servers,DC=nl,DC=eu,DC=com)
+    """
+    print(f"\n  {C.DIM}Fetching OUs from {dc_id}...{C.RESET}")
+    ous = fetch_ous(conn, base_dn)
+
+    if not ous:
+        warn("No OUs found — defaulting to CN=Users")
+        return f"CN=Users,{base_dn}"
+
+    print(f"\n  {C.BOLD}Available OUs on {dc_id}:{C.RESET}")
+    print(f"  {C.DIM}{'No.':<5} {'OU Path'}{C.RESET}")
+    print(f"  {'─'*55}")
+
+    for i, ou in enumerate(ous, 1):
+        # Indent nested OUs visually
+        depth  = ou["path"].count(" / ")
+        indent = "  " * depth
+        label  = ou["path"].split(" / ")[-1]
+        print(f"  {C.CYAN}[{i:>2}]{C.RESET}  {indent}{label}"
+              + (f"  {C.DIM}({ou['path']}){C.RESET}" if depth > 0 else ""))
+
+    print(f"  {C.CYAN}[ 0]{C.RESET}  CN=Users (default container)")
+    print(f"  {C.CYAN}[ M]{C.RESET}  Enter path manually")
+
+    choice = input(f"\n  Select OU [0]: ").strip()
+
+    if choice == "0" or choice == "":
+        return f"CN=Users,{base_dn}"
+
+    if choice.upper() == "M":
+        manual = input("  Full OU path (e.g. OU=Debug servers,OU=PRD Users): ").strip()
+        if not manual:
+            return f"CN=Users,{base_dn}"
+        return f"{manual},{base_dn}"
+
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(ous):
+            selected = ous[idx]
+            ok(f"Selected: {selected['path']}")
+            return selected["dn"]
+    except ValueError:
+        pass
+
+    warn("Invalid choice — using CN=Users")
+    return f"CN=Users,{base_dn}"
+
 def disabled(uac):
     try: return bool(int(str(uac)) & 2)
     except: return False
@@ -294,13 +371,9 @@ def op_create_user(conn, base_dn, dc_id):
     title = input("  Title (optional): ").strip()
     dept  = input("  Department (optional): ").strip()
 
-    print(f"\n  OU:  {C.CYAN}[1]{C.RESET} CN=Users (default)   {C.CYAN}[2]{C.RESET} Custom path")
-    ou_c  = input("  Choice [1]: ").strip()
-    if ou_c == "2":
-        ou  = input("  OU path (e.g. OU=IT,OU=Staff): ").strip()
-        udn = f"CN={first} {last},{ou},{base_dn}"
-    else:
-        udn = f"CN={first} {last},CN=Users,{base_dn}"
+    # Fetch real OUs from DC and let user pick
+    ou_dn = select_ou(conn, base_dn, dc_id)
+    udn   = f"CN={first} {last},{ou_dn}"
 
     pw  = getpass.getpass("\n  Password: ")
     pw2 = getpass.getpass("  Confirm : ")
