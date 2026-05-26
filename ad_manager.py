@@ -116,15 +116,34 @@ def default_sam(first: str, last: str) -> str:
     return f"{first.lower()}.{last.lower()}"
 
 # ── connection ────────────────────────────────────────────────────────────────
+def build_ntlm_user(dc: dict, user: str) -> str:
+    """
+    Ensure the username is in NTLM format: NETBIOS\\username
+    Accepts plain username (jai.ganesh), UPN (jai.ganesh@nl.eu.com),
+    or already-prefixed (NL\\jai.ganesh) -- normalises all to NETBIOS\\username.
+    """
+    netbios = dc["netbios"]
+    # Already has a domain prefix (DOMAIN\user or DOMAIN/user)
+    if "\\" in user or "/" in user:
+        return user
+    # UPN format — strip the domain part
+    if "@" in user:
+        user = user.split("@")[0]
+    # Plain username — add NETBIOS prefix
+    return f"{netbios}\\{user}"
+
+
 def connect(dc, user, pwd) -> Optional[Connection]:
+    ntlm_user = build_ntlm_user(dc, user)
     for port, use_ssl in [(636, True), (389, False)]:
         try:
             tls    = Tls(validate=ssl.CERT_NONE) if use_ssl else None
             server = Server(dc["host"], port=port, use_ssl=use_ssl,
                             tls=tls, get_info=ALL, connect_timeout=8)
-            conn   = Connection(server, user=user, password=pwd,
+            conn   = Connection(server, user=ntlm_user, password=pwd,
                                 authentication=NTLM, auto_bind=True)
-            ok(f"Connected to {dc['id']} ({dc['host']}) via {'LDAPS' if use_ssl else 'LDAP'}")
+            ok(f"Connected to {dc['id']} ({dc['host']}) via {'LDAPS' if use_ssl else 'LDAP'}"
+               f"  {C.DIM}as {ntlm_user}{C.RESET}")
             return conn
         except LDAPBindError:
             err(f"Authentication failed for {dc['id']} — wrong credentials?")
@@ -543,16 +562,14 @@ def select_op():
 def prompt_credentials() -> tuple:
     """
     Prompt for AD credentials once at startup.
-    Accepts NETBIOS format (NL\\firstname.lastname)
-    or UPN format (firstname.lastname@nl.eu.com).
+    Accepts plain username — domain prefix is added automatically per DC.
     """
     print(f"\n{C.BOLD}  Authentication{C.RESET}")
-    print(f"  {C.DIM}Accepted formats:{C.RESET}")
+    print(f"  {C.DIM}Enter your plain username (e.g. firstname.lastname){C.RESET}")
+    print(f"  {C.DIM}Domain prefix is added automatically per DC:{C.RESET}")
     for dc in DCS:
-        example_sam = "firstname.lastname"
-        print(f"  {C.DIM}  {dc['id']:<4}  "
-              f"{fmt_logon(dc, example_sam):<30}  "
-              f"or  {fmt_upn(dc, example_sam)}{C.RESET}")
+        print(f"  {C.DIM}    {dc['id']:<4}  firstname.lastname  →  "
+              f"{fmt_logon(dc, 'firstname.lastname')}{C.RESET}")
     print()
     user = input("  Username: ").strip()
     if not user:
