@@ -33,6 +33,24 @@ class ADOperationError(Exception):
     pass
 
 
+def ask_username(dc: dict, prompt: str = "Username") -> str:
+    """
+    Prompt for a username and show the correct format for this DC.
+    User can type just the plain username — the hint shows what it maps to.
+    LDAP search uses sAMAccountName so no prefix needed in the search value.
+    """
+    example = fmt_logon(dc, "firstname.lastname")
+    raw = input(f"  {prompt} {C.DIM}(plain, e.g. {example}){C.RESET}: ").strip()
+    # Strip any domain prefix if user typed it — LDAP search just needs the sam
+    if "\\" in raw:
+        return raw.split("\\")[-1]
+    if "/" in raw:
+        return raw.split("/")[-1]
+    if "@" in raw:
+        return raw.split("@")[0]
+    return raw
+
+
 def verify_ou_exists(conn, ou_dn: str) -> bool:
     """
     Confirm the given OU DN actually exists on this DC.
@@ -76,7 +94,7 @@ DCS = [
     },
     {
         "id":         "NL",
-        "host":       "nl1-dc01.nl.eu.com",
+        "host":       "nl1-dc1.nl.eu.com",
         "base_dn":    "DC=nl,DC=eu,DC=com",
         "upn_suffix": "nl.eu.com",
         "netbios":    "NL",
@@ -84,7 +102,7 @@ DCS = [
     },
     {
         "id":         "SV",
-        "host":       "sv1-dc01.sv.zen.com",
+        "host":       "sv1-dc1.sv.zen.com",
         "base_dn":    "DC=sv,DC=zen,DC=com",
         "upn_suffix": "sv.zen.com",
         "netbios":    "SV",
@@ -92,7 +110,7 @@ DCS = [
     },
     {
         "id":         "NJ",
-        "host":       "nj1-dc01.nj.zen.com",
+        "host":       "nj1-dc1.nj.zen.com",
         "base_dn":    "DC=nj,DC=zen,DC=com",
         "upn_suffix": "nj.zen.com",
         "netbios":    "NJ",
@@ -116,15 +134,34 @@ def default_sam(first: str, last: str) -> str:
     return f"{first.lower()}.{last.lower()}"
 
 # ── connection ────────────────────────────────────────────────────────────────
+def build_ntlm_user(dc: dict, user: str) -> str:
+    """
+    Ensure the username is in NTLM format: NETBIOS\\username
+    Accepts plain username (jai.ganesh), UPN (jai.ganesh@nl.eu.com),
+    or already-prefixed (NL\\jai.ganesh) -- normalises all to NETBIOS\\username.
+    """
+    netbios = dc["netbios"]
+    # Already has a domain prefix (DOMAIN\user or DOMAIN/user)
+    if "\\" in user or "/" in user:
+        return user
+    # UPN format — strip the domain part
+    if "@" in user:
+        user = user.split("@")[0]
+    # Plain username — add NETBIOS prefix
+    return f"{netbios}\\{user}"
+
+
 def connect(dc, user, pwd) -> Optional[Connection]:
+    ntlm_user = build_ntlm_user(dc, user)
     for port, use_ssl in [(636, True), (389, False)]:
         try:
             tls    = Tls(validate=ssl.CERT_NONE) if use_ssl else None
             server = Server(dc["host"], port=port, use_ssl=use_ssl,
                             tls=tls, get_info=ALL, connect_timeout=8)
-            conn   = Connection(server, user=user, password=pwd,
+            conn   = Connection(server, user=ntlm_user, password=pwd,
                                 authentication=NTLM, auto_bind=True)
-            ok(f"Connected to {dc['id']} ({dc['host']}) via {'LDAPS' if use_ssl else 'LDAP'}")
+            ok(f"Connected to {dc['id']} ({dc['host']}) via {'LDAPS' if use_ssl else 'LDAP'}"
+               f"  {C.DIM}as {ntlm_user}{C.RESET}")
             return conn
         except LDAPBindError:
             err(f"Authentication failed for {dc['id']} — wrong credentials?")
@@ -253,7 +290,8 @@ def confirm(msg) -> bool:
     return input(f"\n  {msg} [y/N]: ").strip().lower() == "y"
 
 # ── operations ────────────────────────────────────────────────────────────────
-def op_reset_password(conn, base_dn, dc_id):
+def op_reset_password(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"PASSWORD RESET — {dc_id}")
     term = input("  Username / email: ").strip()
     if not term: return
@@ -278,9 +316,10 @@ def op_reset_password(conn, base_dn, dc_id):
         err(f"Failed: {conn.result}")
 
 
-def op_unlock(conn, base_dn, dc_id):
+def op_unlock(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"UNLOCK ACCOUNT — {dc_id}")
-    term = input("  Username: ").strip()
+    term = ask_username(dc) if isinstance(dc, dict) else input("  Username: ").strip()
     if not term: return
     u = find_user(conn, base_dn, term)
     if not u: err(f"User '{term}' not found"); return
@@ -292,9 +331,10 @@ def op_unlock(conn, base_dn, dc_id):
         err(f"Failed: {conn.result}")
 
 
-def op_permissions(conn, base_dn, dc_id):
+def op_permissions(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"ACCOUNT PERMISSIONS — {dc_id}")
-    term = input("  Username: ").strip()
+    term = ask_username(dc) if isinstance(dc, dict) else input("  Username: ").strip()
     if not term: return
     u = find_user(conn, base_dn, term)
     if not u: err(f"User '{term}' not found"); return
@@ -325,9 +365,10 @@ def op_permissions(conn, base_dn, dc_id):
         if DEBUG: traceback.print_exc()
 
 
-def op_groups(conn, base_dn, dc_id):
+def op_groups(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"GROUP MEMBERSHIP — {dc_id}")
-    term = input("  Username: ").strip()
+    term = ask_username(dc) if isinstance(dc, dict) else input("  Username: ").strip()
     if not term: return
     u = find_user(conn, base_dn, term)
     if not u: err(f"User '{term}' not found"); return
@@ -357,7 +398,8 @@ def op_groups(conn, base_dn, dc_id):
 
 def clone_groups_from_user(conn, base_dn, dc_id) -> list:
     """Look up an existing user and return their group DNs."""
-    term = input("  Clone groups from username: ").strip()
+    dc_obj2 = next((d for d in DCS if d["id"] == dc_id), None)
+    term = ask_username(dc_obj2, "Clone groups from") if dc_obj2 else input("  Clone groups from username: ").strip()
     if not term: return []
     source = find_user(conn, base_dn, term)
     if not source:
@@ -375,14 +417,15 @@ def clone_groups_from_user(conn, base_dn, dc_id) -> list:
     return list(raw)
 
 
-def op_create_user(conn, base_dn, dc_id):
+def op_create_user(conn, base_dn, dc):
+    dc_id  = dc["id"] if isinstance(dc, dict) else dc
+    dc_obj = dc if isinstance(dc, dict) else next((d for d in DCS if d["id"] == dc_id), None)
     head(f"CREATE USER — {dc_id}")
     first = input("  First name: ").strip()
     last  = input("  Last name : ").strip()
     if not first or not last: err("Name required"); return
 
-    # Per-DC username format: firstname.lastname
-    dc_obj    = next((d for d in DCS if d["id"] == dc_id), None)
+    # dc_obj already resolved from dc parameter
     def_sam   = default_sam(first, last)
     def_upn   = fmt_upn(dc_obj, def_sam)   if dc_obj else f"{def_sam}@{base_dn}"
     def_logon = fmt_logon(dc_obj, def_sam) if dc_obj else def_sam
@@ -495,9 +538,10 @@ def op_create_user(conn, base_dn, dc_id):
         if DEBUG: traceback.print_exc()
 
 
-def op_lookup(conn, base_dn, dc_id):
+def op_lookup(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"LOOK UP USER — {dc_id}")
-    term = input("  Username / email / display name: ").strip()
+    term = ask_username(dc, "Username / display name") if isinstance(dc, dict) else input("  Username: ").strip()
     if not term: return
     u = find_user(conn, base_dn, term)
     if not u: err(f"'{term}' not found on {dc_id}"); return
@@ -543,16 +587,14 @@ def select_op():
 def prompt_credentials() -> tuple:
     """
     Prompt for AD credentials once at startup.
-    Accepts NETBIOS format (NL\\firstname.lastname)
-    or UPN format (firstname.lastname@nl.eu.com).
+    Accepts plain username — domain prefix is added automatically per DC.
     """
     print(f"\n{C.BOLD}  Authentication{C.RESET}")
-    print(f"  {C.DIM}Accepted formats:{C.RESET}")
+    print(f"  {C.DIM}Enter your plain username (e.g. firstname.lastname){C.RESET}")
+    print(f"  {C.DIM}Domain prefix is added automatically per DC:{C.RESET}")
     for dc in DCS:
-        example_sam = "firstname.lastname"
-        print(f"  {C.DIM}  {dc['id']:<4}  "
-              f"{fmt_logon(dc, example_sam):<30}  "
-              f"or  {fmt_upn(dc, example_sam)}{C.RESET}")
+        print(f"  {C.DIM}    {dc['id']:<4}  firstname.lastname  →  "
+              f"{fmt_logon(dc, 'firstname.lastname')}{C.RESET}")
     print()
     user = input("  Username: ").strip()
     if not user:
@@ -575,8 +617,7 @@ def test_connections(dcs: list, user: str, pwd: str) -> dict:
     for dc in dcs:
         conn = connect(dc, user, pwd)
         connections[dc["id"]] = conn
-        if not conn:
-            print(f"  {C.RED}  ✗  {dc['id']} — unreachable or auth failed{C.RESET}")
+        # connect() already prints success/failure — no duplicate message needed
 
     ok_count   = sum(1 for c in connections.values() if c)
     fail_count = len(connections) - ok_count
@@ -586,7 +627,7 @@ def test_connections(dcs: list, user: str, pwd: str) -> dict:
           f"{(C.RED + f'✗ {fail_count} failed' + C.RESET) if fail_count else ''}")
 
     if ok_count == 0:
-        err("\n  No DCs reachable. Check VPN and credentials.")
+        err("No DCs reachable — check VPN and credentials.")
         sys.exit(1)
 
     return connections
@@ -664,12 +705,12 @@ def main():
                 warn(f"No active connection to {dc['id']} — skipping")
                 continue
             try:
-                if   op == "1": op_reset_password(conn, dc["base_dn"], dc["id"])
-                elif op == "2": op_unlock(conn, dc["base_dn"], dc["id"])
-                elif op == "3": op_permissions(conn, dc["base_dn"], dc["id"])
-                elif op == "4": op_groups(conn, dc["base_dn"], dc["id"])
-                elif op == "5": op_create_user(conn, dc["base_dn"], dc["id"])
-                elif op == "6": op_lookup(conn, dc["base_dn"], dc["id"])
+                if   op == "1": op_reset_password(conn, dc["base_dn"], dc)
+                elif op == "2": op_unlock(conn, dc["base_dn"], dc)
+                elif op == "3": op_permissions(conn, dc["base_dn"], dc)
+                elif op == "4": op_groups(conn, dc["base_dn"], dc)
+                elif op == "5": op_create_user(conn, dc["base_dn"], dc)
+                elif op == "6": op_lookup(conn, dc["base_dn"], dc)
             except KeyboardInterrupt:
                 warn("Interrupted")
             except ADOperationError as e:
