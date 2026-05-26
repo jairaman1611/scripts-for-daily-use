@@ -84,7 +84,7 @@ DCS = [
     },
     {
         "id":         "SV",
-        "host":       "sv1-dc01.sv.zen.com",
+        "host":       "sv1-dc1.sv.zen.com",
         "base_dn":    "DC=sv,DC=zen,DC=com",
         "upn_suffix": "sv.zen.com",
         "netbios":    "SV",
@@ -92,7 +92,7 @@ DCS = [
     },
     {
         "id":         "NJ",
-        "host":       "nj1-dc01.nj.zen.com",
+        "host":       "nj1-dc1.nj.zen.com",
         "base_dn":    "DC=nj,DC=zen,DC=com",
         "upn_suffix": "nj.zen.com",
         "netbios":    "NJ",
