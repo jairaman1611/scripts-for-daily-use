@@ -33,6 +33,24 @@ class ADOperationError(Exception):
     pass
 
 
+def ask_username(dc: dict, prompt: str = "Username") -> str:
+    """
+    Prompt for a username and show the correct format for this DC.
+    User can type just the plain username — the hint shows what it maps to.
+    LDAP search uses sAMAccountName so no prefix needed in the search value.
+    """
+    example = fmt_logon(dc, "firstname.lastname")
+    raw = input(f"  {prompt} {C.DIM}(plain, e.g. {example}){C.RESET}: ").strip()
+    # Strip any domain prefix if user typed it — LDAP search just needs the sam
+    if "\\" in raw:
+        return raw.split("\\")[-1]
+    if "/" in raw:
+        return raw.split("/")[-1]
+    if "@" in raw:
+        return raw.split("@")[0]
+    return raw
+
+
 def verify_ou_exists(conn, ou_dn: str) -> bool:
     """
     Confirm the given OU DN actually exists on this DC.
@@ -272,7 +290,8 @@ def confirm(msg) -> bool:
     return input(f"\n  {msg} [y/N]: ").strip().lower() == "y"
 
 # ── operations ────────────────────────────────────────────────────────────────
-def op_reset_password(conn, base_dn, dc_id):
+def op_reset_password(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"PASSWORD RESET — {dc_id}")
     term = input("  Username / email: ").strip()
     if not term: return
@@ -297,9 +316,10 @@ def op_reset_password(conn, base_dn, dc_id):
         err(f"Failed: {conn.result}")
 
 
-def op_unlock(conn, base_dn, dc_id):
+def op_unlock(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"UNLOCK ACCOUNT — {dc_id}")
-    term = input("  Username: ").strip()
+    term = ask_username(dc) if isinstance(dc, dict) else input("  Username: ").strip()
     if not term: return
     u = find_user(conn, base_dn, term)
     if not u: err(f"User '{term}' not found"); return
@@ -311,9 +331,10 @@ def op_unlock(conn, base_dn, dc_id):
         err(f"Failed: {conn.result}")
 
 
-def op_permissions(conn, base_dn, dc_id):
+def op_permissions(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"ACCOUNT PERMISSIONS — {dc_id}")
-    term = input("  Username: ").strip()
+    term = ask_username(dc) if isinstance(dc, dict) else input("  Username: ").strip()
     if not term: return
     u = find_user(conn, base_dn, term)
     if not u: err(f"User '{term}' not found"); return
@@ -344,9 +365,10 @@ def op_permissions(conn, base_dn, dc_id):
         if DEBUG: traceback.print_exc()
 
 
-def op_groups(conn, base_dn, dc_id):
+def op_groups(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"GROUP MEMBERSHIP — {dc_id}")
-    term = input("  Username: ").strip()
+    term = ask_username(dc) if isinstance(dc, dict) else input("  Username: ").strip()
     if not term: return
     u = find_user(conn, base_dn, term)
     if not u: err(f"User '{term}' not found"); return
@@ -376,7 +398,8 @@ def op_groups(conn, base_dn, dc_id):
 
 def clone_groups_from_user(conn, base_dn, dc_id) -> list:
     """Look up an existing user and return their group DNs."""
-    term = input("  Clone groups from username: ").strip()
+    dc_obj2 = next((d for d in DCS if d["id"] == dc_id), None)
+    term = ask_username(dc_obj2, "Clone groups from") if dc_obj2 else input("  Clone groups from username: ").strip()
     if not term: return []
     source = find_user(conn, base_dn, term)
     if not source:
@@ -394,14 +417,15 @@ def clone_groups_from_user(conn, base_dn, dc_id) -> list:
     return list(raw)
 
 
-def op_create_user(conn, base_dn, dc_id):
+def op_create_user(conn, base_dn, dc):
+    dc_id  = dc["id"] if isinstance(dc, dict) else dc
+    dc_obj = dc if isinstance(dc, dict) else next((d for d in DCS if d["id"] == dc_id), None)
     head(f"CREATE USER — {dc_id}")
     first = input("  First name: ").strip()
     last  = input("  Last name : ").strip()
     if not first or not last: err("Name required"); return
 
-    # Per-DC username format: firstname.lastname
-    dc_obj    = next((d for d in DCS if d["id"] == dc_id), None)
+    # dc_obj already resolved from dc parameter
     def_sam   = default_sam(first, last)
     def_upn   = fmt_upn(dc_obj, def_sam)   if dc_obj else f"{def_sam}@{base_dn}"
     def_logon = fmt_logon(dc_obj, def_sam) if dc_obj else def_sam
@@ -514,9 +538,10 @@ def op_create_user(conn, base_dn, dc_id):
         if DEBUG: traceback.print_exc()
 
 
-def op_lookup(conn, base_dn, dc_id):
+def op_lookup(conn, base_dn, dc):
+    dc_id = dc["id"] if isinstance(dc, dict) else dc
     head(f"LOOK UP USER — {dc_id}")
-    term = input("  Username / email / display name: ").strip()
+    term = ask_username(dc, "Username / display name") if isinstance(dc, dict) else input("  Username: ").strip()
     if not term: return
     u = find_user(conn, base_dn, term)
     if not u: err(f"'{term}' not found on {dc_id}"); return
@@ -680,12 +705,12 @@ def main():
                 warn(f"No active connection to {dc['id']} — skipping")
                 continue
             try:
-                if   op == "1": op_reset_password(conn, dc["base_dn"], dc["id"])
-                elif op == "2": op_unlock(conn, dc["base_dn"], dc["id"])
-                elif op == "3": op_permissions(conn, dc["base_dn"], dc["id"])
-                elif op == "4": op_groups(conn, dc["base_dn"], dc["id"])
-                elif op == "5": op_create_user(conn, dc["base_dn"], dc["id"])
-                elif op == "6": op_lookup(conn, dc["base_dn"], dc["id"])
+                if   op == "1": op_reset_password(conn, dc["base_dn"], dc)
+                elif op == "2": op_unlock(conn, dc["base_dn"], dc)
+                elif op == "3": op_permissions(conn, dc["base_dn"], dc)
+                elif op == "4": op_groups(conn, dc["base_dn"], dc)
+                elif op == "5": op_create_user(conn, dc["base_dn"], dc)
+                elif op == "6": op_lookup(conn, dc["base_dn"], dc)
             except KeyboardInterrupt:
                 warn("Interrupted")
             except ADOperationError as e:
